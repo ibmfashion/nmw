@@ -1,0 +1,44 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'        # 每 6 小时自动同步
+  workflow_dispatch:             # 支持手动触发
+  push:
+    branches: [main]             # main 有改动时也同步一次（保持一致）
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: main
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Sync from upstream
+        run: |
+          git remote add upstream https://github.com/Yuan-lab-LLM/ClawManager.git
+          git fetch upstream --tags
+          git checkout main
+          # ff-only：你的 main 应保持纯净镜像，不应有独立提交
+          # 若失败说明 fork 的 main 被人手改过，需手动处理
+          git merge --ff-only upstream/main
+          git push origin main
+          git push origin --tags
+
+      - name: Warn on fast-forward failure
+        if: failure()
+        run: |
+          echo "::warning::Fast-forward failed (fork 的 main 与上游分叉). 需手动 rebase 处理."
+          exit 1
