@@ -8,11 +8,10 @@ name: sync-upstream-to-codearts
 #   2) repository_dispatch(upstream-updated)  外部监听器可即时触发, 见文末 curl 示例
 #   3) workflow_dispatch  手动
 #
-# 变化检测: 比对官方 main 的 SHA 与本 fork upstream-mirror 分支的 SHA, 相同则直接跳过,
-#           避免无谓的 force-push 抖动, 也让短轮询几乎零成本。
-#
-# 需在本 fork(ibmfashion/nmw) Settings -> Secrets -> Actions 配置:
-#   CODEARTS_USER / CODEARTS_PASS  (CodeArts 代码托管 HTTPS 用户名/密码)
+# 认证方式: CodeArts 推送用 SSH 私钥 (secret: CODEARTS_SSH_KEY)。
+#   需在本 fork(ibmfashion/nmw) Settings -> Secrets -> Actions 配置:
+#     CODEARTS_SSH_KEY  = SSH 私钥全文(含 BEGIN/END 行), 对应公钥已加到 CodeArts 个人设置->SSH密钥
+#   fork 侧的 upstream-mirror 分支推送用内置 GITHUB_TOKEN, 无需额外配置。
 
 on:
   schedule:
@@ -30,7 +29,9 @@ concurrency:
 
 env:
   UPSTREAM_URL: https://github.com/Yuan-lab-LLM/ClawManager.git
-  CODEARTS_URL: https://codehub.devcloud.cn-east-3.huaweicloud.com/14dbed93e27c4091967633086e9c75f0/nmw.git
+  # CodeArts SSH 地址 (注意是冒号分隔, 不是斜杠; 仓库名务必与实际一致: nmw 还是 nmw666)
+  CODEARTS_SSH_URL: git@codehub.devcloud.cn-east-3.huaweicloud.com:14dbed93e27c4091967633086e9c75f0/nmw.git
+  CODEARTS_SSH_HOST: codehub.devcloud.cn-east-3.huaweicloud.com
   UPSTREAM_BRANCH: main
 
 jobs:
@@ -60,16 +61,23 @@ jobs:
             echo "sha=$NEW"       >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Push official main to Huawei CodeArts
+      - name: Setup SSH for CodeArts
+        if: steps.detect.outputs.changed == 'true'
+        run: |
+          test -n "${{ secrets.CODEARTS_SSH_KEY }}" || { echo "❌ secret CODEARTS_SSH_KEY 未配置/为空"; exit 1; }
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.CODEARTS_SSH_KEY }}" > ~/.ssh/codearts_key
+          chmod 600 ~/.ssh/codearts_key
+          # 抓取 CodeArts host key, 失败也无妨(下一步 GIT_SSH_COMMAND 用 accept-new 兜底)
+          ssh-keyscan -H "${CODEARTS_SSH_HOST}" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Push official main to Huawei CodeArts (SSH)
         if: steps.detect.outputs.changed == 'true'
         working-directory: work
         env:
-          CA_USER: ${{ secrets.CODEARTS_USER }}
-          CA_PASS: ${{ secrets.CODEARTS_PASS }}
+          GIT_SSH_COMMAND: "ssh -i ~/.ssh/codearts_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
         run: |
-          auth="$(printf '%s:%s' "$CA_USER" "$CA_PASS" | base64 -w0)"
-          git -c http.extraheader="Authorization: Basic ${auth}" \
-            push --force --tags "${CODEARTS_URL}" \
+          git push --force --tags "${CODEARTS_SSH_URL}" \
             "upstream/${UPSTREAM_BRANCH}:refs/heads/main"
           echo "✅ 已把官方 ${{ steps.detect.outputs.sha }} 推送到 CodeArts main"
 
@@ -79,16 +87,15 @@ jobs:
         if: steps.detect.outputs.changed == 'true'
         working-directory: work
         run: |
-          # 只推分支内容, 不推 tags: 该分支仅用于变化检测(比对 SHA), 不需要 tag。
-          # 且默认 GITHUB_TOKEN(GitHub App)无 workflows 权限, 推带 .github/workflows 改动的 tag 会被拒。
-          # 官方版本 tag 已由上一步推到 CodeArts(非 GitHub, 不受此限制)。
+          # 只推分支内容, 不推 tags: 仅用于变化检测比对 SHA; 且默认 GITHUB_TOKEN 无 workflows 权限,
+          # 推带 .github/workflows 改动的 tag 会被拒(官方版本 tag 已在上一步推到 CodeArts)。
           git push --force \
             "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
             "upstream/${UPSTREAM_BRANCH}:refs/heads/upstream-mirror"
 
       - name: Summary
         if: steps.detect.outputs.changed == 'true'
-        run: echo "同步完成。CodeArts 会触发'验证构建'流水线; ECS 端执行 ops/huawei/01-sync-upstream.sh 合并进 custom。"
+        run: echo "同步完成。CodeArts 会触发验证构建; ECS 端执行 ops/huawei/01-sync-upstream.sh 合并进 custom。"
 
 # ── 外部即时触发示例(可选) ──────────────────────────────────────────────
 # 任意能访问 GitHub API 的监听器(如自建脚本轮询官方 releases.atom/commits.atom,
