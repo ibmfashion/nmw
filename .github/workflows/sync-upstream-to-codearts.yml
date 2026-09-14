@@ -1,0 +1,96 @@
+name: sync-upstream-to-codearts
+
+# 作用: 把官方 ClawManager 的 main 同步到本 fork(upstream-mirror) 并推送到华为云 CodeArts main。
+#       custom 分支只在 CodeArts, 本流程不涉及。
+#
+# 触发方式:
+#   1) schedule    每 ~15 分钟轮询官方是否有新 commit (近实时; GitHub 无法给非本人仓库配 webhook)
+#   2) repository_dispatch(upstream-updated)  外部监听器可即时触发, 见文末 curl 示例
+#   3) workflow_dispatch  手动
+#
+# 变化检测: 比对官方 main 的 SHA 与本 fork upstream-mirror 分支的 SHA, 相同则直接跳过,
+#           避免无谓的 force-push 抖动, 也让短轮询几乎零成本。
+#
+# 需在本 fork(ibmfashion/nmw) Settings -> Secrets -> Actions 配置:
+#   CODEARTS_USER / CODEARTS_PASS  (CodeArts 代码托管 HTTPS 用户名/密码)
+
+on:
+  schedule:
+    - cron: '3,18,33,48 * * * *'   # 约每 15 分钟, 避开整点
+  repository_dispatch:
+    types: [upstream-updated]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-mirror
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/Yuan-lab-LLM/ClawManager.git
+  CODEARTS_URL: https://codehub.devcloud.cn-east-3.huaweicloud.com/14dbed93e27c4091967633086e9c75f0/nmw.git
+  UPSTREAM_BRANCH: main
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure git
+        run: |
+          git config --global user.name  "mirror-bot"
+          git config --global user.email "mirror-bot@users.noreply.github.com"
+
+      - name: Detect upstream change
+        id: detect
+        run: |
+          git init work && cd work
+          git remote add upstream "${UPSTREAM_URL}"
+          git fetch --tags upstream "${UPSTREAM_BRANCH}"
+          NEW="$(git rev-parse upstream/${UPSTREAM_BRANCH})"
+          FORK="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          OLD="$(git ls-remote "$FORK" refs/heads/upstream-mirror | awk '{print $1}')"
+          echo "官方 main = ${NEW:0:12} ; 上次已镜像 = ${OLD:0:12}"
+          if [ "$NEW" = "$OLD" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "无新 commit, 跳过。"
+          else
+            echo "changed=true"  >> "$GITHUB_OUTPUT"
+            echo "sha=$NEW"       >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update fork mirror branch (upstream-mirror)
+        if: steps.detect.outputs.changed == 'true'
+        working-directory: work
+        run: |
+          git push --force --tags \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
+            "upstream/${UPSTREAM_BRANCH}:refs/heads/upstream-mirror"
+
+      - name: Push official main to Huawei CodeArts
+        if: steps.detect.outputs.changed == 'true'
+        working-directory: work
+        env:
+          CA_USER: ${{ secrets.CODEARTS_USER }}
+          CA_PASS: ${{ secrets.CODEARTS_PASS }}
+        run: |
+          auth="$(printf '%s:%s' "$CA_USER" "$CA_PASS" | base64 -w0)"
+          git -c http.extraheader="Authorization: Basic ${auth}" \
+            push --force --tags "${CODEARTS_URL}" \
+            "upstream/${UPSTREAM_BRANCH}:refs/heads/main"
+          echo "✅ 已把官方 ${{ steps.detect.outputs.sha }} 推送到 CodeArts main"
+
+      - name: Summary
+        if: steps.detect.outputs.changed == 'true'
+        run: echo "同步完成。CodeArts 会触发'验证构建'流水线; ECS 端执行 ops/huawei/01-sync-upstream.sh 合并进 custom。"
+
+# ── 外部即时触发示例(可选) ──────────────────────────────────────────────
+# 任意能访问 GitHub API 的监听器(如自建脚本轮询官方 releases.atom/commits.atom,
+# 或 IFTTT/Zapier)发现官方更新后, POST 下面接口即可秒级触发本流程:
+#
+#   curl -X POST \
+#     -H "Authorization: Bearer <你的PAT, 需 repo 权限>" \
+#     -H "Accept: application/vnd.github+json" \
+#     https://api.github.com/repos/ibmfashion/nmw/dispatches \
+#     -d '{"event_type":"upstream-updated"}'
