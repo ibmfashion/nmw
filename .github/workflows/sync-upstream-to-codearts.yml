@@ -60,14 +60,6 @@ jobs:
             echo "sha=$NEW"       >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Update fork mirror branch (upstream-mirror)
-        if: steps.detect.outputs.changed == 'true'
-        working-directory: work
-        run: |
-          git push --force --tags \
-            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
-            "upstream/${UPSTREAM_BRANCH}:refs/heads/upstream-mirror"
-
       - name: Push official main to Huawei CodeArts
         if: steps.detect.outputs.changed == 'true'
         working-directory: work
@@ -80,6 +72,19 @@ jobs:
             push --force --tags "${CODEARTS_URL}" \
             "upstream/${UPSTREAM_BRANCH}:refs/heads/main"
           echo "✅ 已把官方 ${{ steps.detect.outputs.sha }} 推送到 CodeArts main"
+
+      - name: Advance fork mirror marker (upstream-mirror)
+        # 放在 CodeArts 推送成功之后: 这个分支是"已同步"标记, 只有 CodeArts 真拿到代码才前进,
+        # 否则下次 detect 仍判定 changed=true 会自动重试, 不会出现"标记超前但 CodeArts 没同步"的死锁。
+        if: steps.detect.outputs.changed == 'true'
+        working-directory: work
+        run: |
+          # 只推分支内容, 不推 tags: 该分支仅用于变化检测(比对 SHA), 不需要 tag。
+          # 且默认 GITHUB_TOKEN(GitHub App)无 workflows 权限, 推带 .github/workflows 改动的 tag 会被拒。
+          # 官方版本 tag 已由上一步推到 CodeArts(非 GitHub, 不受此限制)。
+          git push --force \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
+            "upstream/${UPSTREAM_BRANCH}:refs/heads/upstream-mirror"
 
       - name: Summary
         if: steps.detect.outputs.changed == 'true'
