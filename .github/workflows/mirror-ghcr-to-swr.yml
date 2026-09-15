@@ -1,0 +1,118 @@
+name: mirror-ghcr-to-swr
+
+# 作用: 把 ghcr.io / docker.io 上的镜像(尤其官方 yuan-lab-llm/agentsruntime/*-lite)
+#      原样搬进华为云 SWR, 供 k3s 拉取。
+#
+# 为什么用 GitHub Actions 搬而不是在 ECS 上搬:
+#   GitHub runner 在境外, 访问 ghcr.io 快速稳定; ECS(国内)直连 ghcr 极慢,
+#   走 ghcr.nju.edu.cn 之类代理源又常有镜像缺缓存/无 arm64 版的问题。
+#
+# 认证(本 fork Settings -> Secrets and variables -> Actions):
+#   SWR_USER       必填, 形如 "cn-east-3@<你的AK>"
+#   SWR_LOGIN_KEY  推荐, 64 位登录密钥(_common.sh 里 swr_login_key 的输出)
+#   SWR_AK/SWR_SK  可选, 未配 SWR_LOGIN_KEY 时用它按华为算法现场计算
+#
+# 用法: Actions -> mirror-ghcr-to-swr -> Run workflow, images 填逗号分隔的镜像路径。
+#      目标镜像名取路径最后一段(与 ops/huawei/_common.sh 的 mirror_dst 规则一致),
+#      所以推到 SWR 后清单里的镜像引用能直接对上, 无需改清单。
+
+on:
+  workflow_dispatch:
+    inputs:
+      images:
+        description: '要搬运的镜像(逗号分隔, 不含 registry 前缀)'
+        required: true
+        default: 'yuan-lab-llm/agentsruntime/openclaw-lite:latest,yuan-lab-llm/agentsruntime/opencode-lite:latest'
+      registry:
+        description: '源 registry'
+        required: true
+        default: 'ghcr.io'
+        type: choice
+        options: [ghcr.io, docker.io]
+      swr_host:
+        description: 'SWR 地址'
+        required: true
+        default: 'swr.cn-east-3.myhuaweicloud.com'
+      swr_org:
+        description: 'SWR 组织名'
+        required: true
+        default: 'wqdoa'
+      platform:
+        description: '目标架构'
+        required: true
+        default: 'linux/arm64'
+        type: choice
+        options: [linux/arm64, linux/amd64]
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve SWR credentials
+        id: cred
+        env:
+          SWR_AK: ${{ secrets.SWR_AK }}
+          SWR_SK: ${{ secrets.SWR_SK }}
+          SWR_LOGIN_KEY: ${{ secrets.SWR_LOGIN_KEY }}
+        run: |
+          if [ -n "${SWR_LOGIN_KEY}" ]; then
+            key="${SWR_LOGIN_KEY}"
+          elif [ -n "${SWR_AK}" ] && [ -n "${SWR_SK}" ]; then
+            # 与 ops/huawei/_common.sh swr_login_key 相同的算法
+            key="$(printf '%s' "$SWR_AK" | openssl dgst -binary -sha256 -hmac "$SWR_SK" | od -An -vtx1 | tr -d ' \n')"
+          else
+            echo "❌ 需配置 SWR_LOGIN_KEY, 或同时配置 SWR_AK 与 SWR_SK"; exit 1
+          fi
+          echo "::add-mask::${key}"
+          echo "key=${key}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to SWR
+        env:
+          SWR_USER: ${{ secrets.SWR_USER }}
+        run: |
+          test -n "${SWR_USER}" || { echo "❌ 未配置 SWR_USER"; exit 1; }
+          echo "${{ steps.cred.outputs.key }}" \
+            | docker login "${{ github.event.inputs.swr_host }}" -u "${SWR_USER}" --password-stdin
+
+      - name: Pull and push images
+        env:
+          REGISTRY: ${{ github.event.inputs.registry }}
+          SWR_HOST: ${{ github.event.inputs.swr_host }}
+          SWR_ORG: ${{ github.event.inputs.swr_org }}
+          PLATFORM: ${{ github.event.inputs.platform }}
+          IMAGES: ${{ github.event.inputs.images }}
+        run: |
+          dst="${SWR_HOST}/${SWR_ORG}"
+          IFS=',' read -ra IMGS <<< "${IMAGES}"
+          fail=0; ok=""; bad=""
+          for raw in "${IMGS[@]}"; do
+            path="$(echo "$raw" | xargs)"                       # 去空白
+            [ -z "$path" ] && continue
+            path="${path#${REGISTRY}/}"                         # 容错: 去掉用户可能手写的 registry 前缀
+            # docker.io 官方镜像补 library/ 前缀
+            if [ "${REGISTRY}" = "docker.io" ] && [ "$(echo "$path" | tr -cd '/' | wc -c)" = "0" ]; then
+              path="library/${path}"
+            fi
+            src="${REGISTRY}/${path}"
+            name="$(basename "$path")"                          # 末段 = SWR 镜像名:tag, 与 mirror_dst 一致
+            echo "==> ${src}  ->  ${dst}/${name}  (${PLATFORM})"
+            if ! docker pull --platform "${PLATFORM}" "${src}"; then
+              echo "❌ pull 失败: ${src}"; bad="${bad} ${name}"; fail=1; continue
+            fi
+            docker tag "${src}" "${dst}/${name}"
+            if docker push "${dst}/${name}"; then
+              ok="${ok} ${name}"
+            else
+              echo "❌ push 失败: ${dst}/${name}"; bad="${bad} ${name}"; fail=1
+            fi
+          done
+          echo "-----------------------------"
+          echo "✅ 成功:${ok:- (无)}"
+          echo "❌ 失败:${bad:- (无)}"
+          exit $fail
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "搬运完成。已在 SWR: ${{ github.event.inputs.swr_host }}/${{ github.event.inputs.swr_org }}"
+          echo "ECS 端让 k3s 重拉: k3s kubectl rollout restart deploy -n clawmanager-system"
