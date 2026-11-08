@@ -22,6 +22,9 @@ on:
 
 permissions:
   contents: write
+  # 官方 main 会改 .github/workflows(如 build.yml), GITHUB_TOKEN 推含 workflow
+  # 变更的引用必须有 workflows 权限, 否则 advance fork mirror 一步被 remote rejected。
+  workflows: write
 
 concurrency:
   group: sync-mirror
@@ -87,8 +90,8 @@ jobs:
         if: steps.detect.outputs.changed == 'true'
         working-directory: work
         run: |
-          # 只推分支内容, 不推 tags: 仅用于变化检测比对 SHA; 且默认 GITHUB_TOKEN 无 workflows 权限,
-          # 推带 .github/workflows 改动的 tag 会被拒(官方版本 tag 已在上一步推到 CodeArts)。
+          # 只推分支内容, 不推 tags: 仅用于变化检测比对 SHA。推含 .github/workflows
+          # 变更的引用需要 workflows 权限(已在 permissions 里配置)。
           git push --force \
             "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
             "upstream/${UPSTREAM_BRANCH}:refs/heads/upstream-mirror"
